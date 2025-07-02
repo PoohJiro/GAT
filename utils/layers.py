@@ -2,6 +2,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 
+conv1d = tf.compat.v1.layers.conv1d
 
 def attention_head(seq, out_sz, bias_mat, activation, 
                   in_drop=0.0, coef_drop=0.0, residual=False, training=True):

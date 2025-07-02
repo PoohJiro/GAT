@@ -2,367 +2,241 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers as tf_layers
+from tensorflow.keras.regularizers import l2
 
-
+# --- 1. GraphAttentionLayer の修正 ---
 class GraphAttentionLayer(tf_layers.Layer):
     """
-    Graph Attention Layer implementation
+    Graph Attention Layer (修正版)
+    - DropoutをKerasレイヤーに変更
+    - バイアス処理を簡潔化
+    - get_configを追加し、モデルの保存/読み込みに対応
     """
-    def __init__(self, out_sz, activation=tf.nn.elu, in_drop=0.0, 
-                 coef_drop=0.0, residual=False, **kwargs):
+    def __init__(self, out_sz, activation=tf.nn.elu, in_drop=0.0,
+                 coef_drop=0.0, residual=False, l2_reg=0.0, **kwargs):
         super().__init__(**kwargs)
         self.out_sz = out_sz
         self.activation = activation
-        self.in_drop = in_drop
-        self.coef_drop = coef_drop
         self.residual = residual
+
+        # Dropoutレイヤーを初期化
+        self.in_dropout = tf_layers.Dropout(in_drop)
+        self.coef_dropout = tf_layers.Dropout(coef_drop)
+
+        # 線形変換レイヤー (バイアスをここで追加)
+        self.linear_transform = tf_layers.Conv1D(out_sz, 1, use_bias=False, kernel_regularizer=l2(l2_reg))
         
-        # Initialize layers
-        self.linear_transform = tf_layers.Conv1D(out_sz, 1, use_bias=False)
-        self.attention_left = tf_layers.Conv1D(1, 1)
-        self.attention_right = tf_layers.Conv1D(1, 1)
-        self.bias_layer = tf_layers.Dense(out_sz, use_bias=True)
+        # アテンション計算用のレイヤー
+        self.attention_left = tf_layers.Conv1D(1, 1, kernel_regularizer=l2(l2_reg))
+        self.attention_right = tf_layers.Conv1D(1, 1, kernel_regularizer=l2(l2_reg))
+        
+        # バイアス項
+        self.bias = self.add_weight(shape=(out_sz,),
+                                    initializer='zeros',
+                                    trainable=True,
+                                    name='bias')
+
+        # Residual接続用の射影レイヤー (入力と出力の次元が違う場合)
         self.residual_proj = None
-    
+
     def build(self, input_shape):
-        super().build(input_shape)
         if self.residual and input_shape[-1] != self.out_sz:
             self.residual_proj = tf_layers.Conv1D(self.out_sz, 1)
-    
-    def call(self, inputs, bias_mat=None, training=None):
+        super().build(input_shape)
+
+    def call(self, inputs, bias_mat=None):
         seq = inputs
-        
-        # Input dropout
-        if self.in_drop > 0.0:
-            seq = tf.nn.dropout(seq, rate=self.in_drop, training=training)
-        
-        # Linear transformation
+
+        # 1. 入力の特徴量にDropoutを適用
+        seq = self.in_dropout(seq)
+
+        # 2. 線形変換
         seq_fts = self.linear_transform(seq)
+
+        # 3. アテンション係数の計算
+        f_1 = self.attention_left(seq_fts)
+        f_2 = self.attention_right(seq_fts)
+        logits = f_1 + tf.transpose(f_2, [0, 2, 1])
         
-        # Attention mechanism
-        f_1 = self.attention_left(seq_fts)  # [batch, nodes, 1]
-        f_2 = self.attention_right(seq_fts)  # [batch, nodes, 1]
-        
-        # Compute attention logits
-        logits = f_1 + tf.transpose(f_2, [0, 2, 1])  # [batch, nodes, nodes]
-        
-        # Apply bias matrix (adjacency matrix) if provided
+        # 隣接行列の情報を加味
         if bias_mat is not None:
+            # bias_matは0と-infで構成されていると仮定
             logits += bias_mat
+
+        coefs = tf.nn.softmax(tf.nn.leaky_relu(logits, alpha=0.2))
+
+        # 4. アテンション係数にDropoutを適用
+        coefs = self.coef_dropout(coefs)
         
-        # Apply activation and softmax
-        coefs = tf.nn.softmax(tf.nn.leaky_relu(logits, alpha=0.2), axis=-1)
-        
-        # Attention coefficient dropout
-        if self.coef_drop > 0.0:
-            coefs = tf.nn.dropout(coefs, rate=self.coef_drop, training=training)
-        
-        # Apply input dropout to features
-        if self.in_drop > 0.0:
-            seq_fts = tf.nn.dropout(seq_fts, rate=self.in_drop, training=training)
-        
-        # Weighted aggregation
+        # 5. 特徴量に再度Dropoutを適用 (論文に忠実な実装)
+        seq_fts = self.in_dropout(seq_fts)
+
+        # 6. アテンション係数を用いて特徴量を集約
         vals = tf.matmul(coefs, seq_fts)
-        vals = self.bias_layer(vals)
-        
-        # Residual connection
+        vals += self.bias
+
+        # 7. Residual接続
         if self.residual:
-            if self.residual_proj is not None:
-                vals = vals + self.residual_proj(seq)
+            if self.residual_proj:
+                vals += self.residual_proj(seq)
             else:
-                vals = vals + seq
-        
+                vals += seq
+
         return self.activation(vals)
 
-
-class MultiHeadGraphAttention(tf_layers.Layer):
-    """
-    Multi-head Graph Attention Layer
-    """
-    def __init__(self, out_sz, n_heads, activation=tf.nn.elu, in_drop=0.0,
-                 coef_drop=0.0, residual=False, concat=True, **kwargs):
-        super().__init__(**kwargs)
-        self.out_sz = out_sz
-        self.n_heads = n_heads
-        self.activation = activation
-        self.in_drop = in_drop
-        self.coef_drop = coef_drop
-        self.residual = residual
-        self.concat = concat
-        
-        # Create attention heads
-        self.attention_heads = []
-        head_out_sz = out_sz // n_heads if concat else out_sz
-        
-        for i in range(n_heads):
-            self.attention_heads.append(
-                GraphAttentionLayer(
-                    out_sz=head_out_sz,
-                    activation=activation,
-                    in_drop=in_drop,
-                    coef_drop=coef_drop,
-                    residual=residual,
-                    name=f'attention_head_{i}'
-                )
-            )
-    
-    def call(self, inputs, bias_mat=None, training=None):
-        # Apply each attention head
-        head_outputs = []
-        for head in self.attention_heads:
-            head_out = head(inputs, bias_mat=bias_mat, training=training)
-            head_outputs.append(head_out)
-        
-        if self.concat:
-            # Concatenate head outputs
-            return tf.concat(head_outputs, axis=-1)
-        else:
-            # Average head outputs
-            return tf.reduce_mean(tf.stack(head_outputs, axis=0), axis=0)
-
-
-class GAT(keras.Model):
-    """
-    Graph Attention Network model
-    """
-    def __init__(self, nb_classes, nb_nodes, hid_units, n_heads, 
-                 activation=tf.nn.elu, in_drop=0.0, attn_drop=0.0, 
-                 ffd_drop=0.0, residual=False, **kwargs):
-        super().__init__(**kwargs)
-        
-        self.nb_classes = nb_classes
-        self.nb_nodes = nb_nodes
-        self.hid_units = hid_units
-        self.n_heads = n_heads
-        self.activation = activation
-        self.in_drop = in_drop
-        self.attn_drop = attn_drop
-        self.ffd_drop = ffd_drop
-        self.residual = residual
-        
-        # Input dropout
-        self.input_dropout = tf_layers.Dropout(rate=in_drop)
-        
-        # Build GAT layers
-        self.gat_layers = []
-        
-        # Hidden layers
-        for i, (hid_unit, n_head) in enumerate(zip(hid_units, n_heads[:-1])):
-            layer = MultiHeadGraphAttention(
-                out_sz=hid_unit,
-                n_heads=n_head,
-                activation=activation,
-                in_drop=ffd_drop,
-                coef_drop=attn_drop,
-                residual=residual if i > 0 else False,  # No residual for first layer
-                concat=True,
-                name=f'gat_layer_{i}'
-            )
-            self.gat_layers.append(layer)
-        
-        # Output layer (final attention heads)
-        self.output_heads = []
-        for i in range(n_heads[-1]):
-            head = GraphAttentionLayer(
-                out_sz=nb_classes,
-                activation=lambda x: x,  # No activation for output
-                in_drop=ffd_drop,
-                coef_drop=attn_drop,
-                residual=False,
-                name=f'output_head_{i}'
-            )
-            self.output_heads.append(head)
-    
-    def call(self, inputs, bias_mat=None, training=None):
-        """
-        Forward pass of GAT model
-        
-        Args:
-            inputs: Input node features [batch_size, nb_nodes, feature_dim]
-            bias_mat: Bias matrix (adjacency matrix) [batch_size, nb_nodes, nb_nodes]
-            training: Training mode flag
-        
-        Returns:
-            logits: Output logits [batch_size, nb_nodes, nb_classes]
-        """
-        x = inputs
-        
-        # Apply input dropout
-        if self.in_drop > 0.0:
-            x = self.input_dropout(x, training=training)
-        
-        # Forward through GAT layers
-        for gat_layer in self.gat_layers:
-            x = gat_layer(x, bias_mat=bias_mat, training=training)
-        
-        # Output layer: apply multiple heads and average
-        head_outputs = []
-        for head in self.output_heads:
-            head_out = head(x, bias_mat=bias_mat, training=training)
-            head_outputs.append(head_out)
-        
-        # Average the outputs from multiple heads
-        if len(head_outputs) > 1:
-            logits = tf.reduce_mean(tf.stack(head_outputs, axis=0), axis=0)
-        else:
-            logits = head_outputs[0]
-        
-        return logits
-    
     def get_config(self):
         config = super().get_config()
         config.update({
-            'nb_classes': self.nb_classes,
-            'nb_nodes': self.nb_nodes,
-            'hid_units': self.hid_units,
-            'n_heads': self.n_heads,
+            'out_sz': self.out_sz,
             'activation': keras.activations.serialize(self.activation),
-            'in_drop': self.in_drop,
-            'attn_drop': self.attn_drop,
-            'ffd_drop': self.ffd_drop,
-            'residual': self.residual
+            'in_drop': self.in_dropout.rate,
+            'coef_drop': self.coef_dropout.rate,
+            'residual': self.residual,
+            'l2_reg': self.linear_transform.kernel_regularizer.l2 if self.linear_transform.kernel_regularizer else 0.0
         })
         return config
 
 
-# Functional API version for more flexibility
-def create_gat_model(nb_classes, nb_nodes, hid_units, n_heads,
-                    activation=tf.nn.elu, in_drop=0.0, attn_drop=0.0,
-                    ffd_drop=0.0, residual=False, input_dim=None):
+# --- 2. MultiHeadGraphAttention の修正 ---
+class MultiHeadGraphAttention(tf_layers.Layer):
     """
-    Create GAT model using Functional API
-    
-    Args:
-        nb_classes: Number of output classes
-        nb_nodes: Number of nodes in the graph
-        hid_units: List of hidden unit sizes
-        n_heads: List of number of attention heads for each layer
-        activation: Activation function
-        in_drop: Input dropout rate
-        attn_drop: Attention dropout rate
-        ffd_drop: Feature dropout rate
-        residual: Whether to use residual connections
-        input_dim: Input feature dimension
-    
-    Returns:
-        Keras Model
+    Multi-head Graph Attention Layer (修正版)
+    - get_configを追加し、モデルの保存/読み込みに対応
     """
-    # Input layers
+    def __init__(self, out_sz, n_heads, activation=tf.nn.elu, in_drop=0.0,
+                 coef_drop=0.0, residual=False, concat=True, l2_reg=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.out_sz = out_sz
+        self.n_heads = n_heads
+        self.concat = concat
+
+        if concat:
+            # 連結する場合、各ヘッドの出力次元を調整
+            assert out_sz % n_heads == 0
+            self.head_out_sz = out_sz // n_heads
+        else:
+            # 平均化する場合、各ヘッドの出力次元は同じ
+            self.head_out_sz = out_sz
+
+        self.attention_heads = [
+            GraphAttentionLayer(
+                out_sz=self.head_out_sz,
+                activation=activation,
+                in_drop=in_drop,
+                coef_drop=coef_drop,
+                residual=residual,
+                l2_reg=l2_reg,
+                name=f'attention_head_{i}'
+            ) for i in range(n_heads)
+        ]
+
+    def call(self, inputs, bias_mat=None):
+        head_outputs = [head(inputs, bias_mat=bias_mat) for head in self.attention_heads]
+
+        if self.concat:
+            return tf.concat(head_outputs, axis=-1)
+        else:
+            return tf.reduce_mean(tf.stack(head_outputs, axis=-1), axis=-1)
+
+    def get_config(self):
+        # 最初のヘッドから設定を取得（全ヘッドで共通のため）
+        head_config = self.attention_heads[0].get_config()
+        config = super().get_config()
+        config.update({
+            'out_sz': self.out_sz,
+            'n_heads': self.n_heads,
+            'activation': head_config['activation'],
+            'in_drop': head_config['in_drop'],
+            'coef_drop': head_config['coef_drop'],
+            'residual': head_config['residual'],
+            'concat': self.concat,
+            'l2_reg': head_config['l2_reg']
+        })
+        return config
+
+
+# --- 3. GATモデル (Functional API版) ---
+def create_gat_model(nb_classes, nb_nodes, input_dim, hid_units, n_heads,
+                     activation=tf.nn.elu, in_drop=0.0, attn_drop=0.0,
+                     residual=False, l2_reg=0.0):
+    """
+    GATモデルをFunctional APIで構築 (修正・簡略化版)
+    - hid_units: 隠れ層のユニット数のリスト (例: [8, 8])
+    - n_heads: 各隠れ層と出力層のヘッド数のリスト (例: [8, 8, 1])
+    """
     node_features = keras.Input(shape=(nb_nodes, input_dim), name='node_features')
     bias_matrix = keras.Input(shape=(nb_nodes, nb_nodes), name='bias_matrix')
-    
+
     x = node_features
-    
-    # Input dropout
+
+    # 入力Dropout
     if in_drop > 0.0:
         x = tf_layers.Dropout(in_drop)(x)
-    
-    # Hidden layers
-    for i, (hid_unit, n_head) in enumerate(zip(hid_units, n_heads[:-1])):
-        multi_head_layer = MultiHeadGraphAttention(
-            out_sz=hid_unit,
-            n_heads=n_head,
+
+    # 隠れ層
+    for i, (units, heads) in enumerate(zip(hid_units, n_heads[:-1])):
+        x = MultiHeadGraphAttention(
+            out_sz=units,
+            n_heads=heads,
             activation=activation,
-            in_drop=ffd_drop,
+            in_drop=in_drop,
             coef_drop=attn_drop,
-            residual=residual if i > 0 else False,
+            residual=residual,
             concat=True,
-            name=f'multi_head_gat_{i}'
-        )
-        x = multi_head_layer(x, bias_mat=bias_matrix)
-    
-    # Output layer
-    output_heads = []
-    for i in range(n_heads[-1]):
-        head = GraphAttentionLayer(
-            out_sz=nb_classes,
-            activation=lambda x: x,
-            in_drop=ffd_drop,
-            coef_drop=attn_drop,
-            residual=False,
-            name=f'output_head_{i}'
-        )
-        head_out = head(x, bias_mat=bias_matrix)
-        output_heads.append(head_out)
-    
-    # Average output heads
-    if len(output_heads) > 1:
-        logits = tf_layers.Average()(output_heads)
-    else:
-        logits = output_heads[0]
-    
-    model = keras.Model(
-        inputs=[node_features, bias_matrix], 
-        outputs=logits, 
-        name='GAT'
-    )
-    
+            l2_reg=l2_reg,
+            name=f'hidden_gat_layer_{i}'
+        )(x, bias_mat=bias_matrix)
+
+    # 出力層 (MultiHeadGraphAttentionで平均化)
+    output_heads = n_heads[-1]
+    logits = MultiHeadGraphAttention(
+        out_sz=nb_classes,
+        n_heads=output_heads,
+        activation=lambda x: x,  # 出力層なので活性化関数はなし
+        in_drop=in_drop,
+        coef_drop=attn_drop,
+        residual=False,
+        concat=False, # 最後の層は平均化
+        l2_reg=l2_reg,
+        name='output_gat_layer'
+    )(x, bias_mat=bias_matrix)
+
+    model = keras.Model(inputs=[node_features, bias_matrix], outputs=logits, name='GAT')
     return model
 
+# --- 4. 非推奨の関数の削除 ---
 
-# Legacy-compatible inference function
-def gat_inference(inputs, nb_classes, nb_nodes, training, attn_drop, ffd_drop,
-                 bias_mat, hid_units, n_heads, activation=tf.nn.elu, residual=False):
-    """
-    Legacy-compatible GAT inference function
-    
-    This function maintains compatibility with the original interface
-    while using the improved implementation under the hood.
-    """
-    # Create GAT model
-    model = GAT(
-        nb_classes=nb_classes,
-        nb_nodes=nb_nodes,
-        hid_units=hid_units,
-        n_heads=n_heads,
-        activation=activation,
-        attn_drop=attn_drop,
-        ffd_drop=ffd_drop,
-        residual=residual
-    )
-    
-    # Run inference
-    logits = model(inputs, bias_mat=bias_mat, training=training)
-    
-    return logits
+# Coraデータセットを想定したパラメータ例
+NB_CLASSES = 7
+NB_NODES = 2708
+INPUT_DIM = 1433
 
+# モデルのハイパーパラメータ
+HID_UNITS = [8]  # 隠れ層のユニット数
+N_HEADS = [8, 1] # 隠れ層(8ヘッド)、出力層(1ヘッド)
 
-# Usage examples
-"""
-# Example 1: Using the GAT class
-nb_classes = 7
-nb_nodes = 2708
-hid_units = [8, 8]
-n_heads = [8, 8, 1]  # 8 heads for each hidden layer, 1 head for output
+# L2正則化とDropoutのレート
+L2_REG = 5e-4
+IN_DROP = 0.6
+ATTN_DROP = 0.6
 
-model = GAT(
-    nb_classes=nb_classes,
-    nb_nodes=nb_nodes,
-    hid_units=hid_units,
-    n_heads=n_heads,
-    activation=tf.nn.elu,
-    in_drop=0.6,
-    attn_drop=0.6,
-    ffd_drop=0.6,
-    residual=True
+# モデルの作成
+model = create_gat_model(
+    nb_classes=NB_CLASSES,
+    nb_nodes=NB_NODES,
+    input_dim=INPUT_DIM,
+    hid_units=HID_UNITS,
+    n_heads=N_HEADS,
+    residual=False, # Coraの実験では通常False
+    in_drop=IN_DROP,
+    attn_drop=ATTN_DROP,
+    l2_reg=L2_REG
 )
 
-# Example 2: Using functional API
-input_dim = 1433
-functional_model = create_gat_model(
-    nb_classes=nb_classes,
-    nb_nodes=nb_nodes,
-    hid_units=hid_units,
-    n_heads=n_heads,
-    input_dim=input_dim,
-    in_drop=0.6,
-    attn_drop=0.6,
-    ffd_drop=0.6,
-    residual=True
-)
+model.summary()
 
-# Example 3: Training setup
-optimizer = keras.optimizers.Adam(learning_rate=0.005, weight_decay=5e-4)
+# モデルのコンパイル
+optimizer = keras.optimizers.Adam(learning_rate=0.005)
 loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 
 model.compile(
@@ -371,6 +245,19 @@ model.compile(
     metrics=['accuracy']
 )
 
-# Training
-# model.fit([X, adj_matrix], y, epochs=200, validation_split=0.2)
-"""
+# ダミーデータで実行を確認
+# batch_size = 1
+# dummy_features = np.random.rand(1, NB_NODES, INPUT_DIM).astype(np.float32)
+# dummy_adj = np.random.randint(0, 2, size=(1, NB_NODES, NB_NODES)).astype(np.float32)
+# # GATでは、隣接がない部分のアテンションを無視するために-infに近い大きな負の値を入れる
+# dummy_bias_mat = -1e9 * (1.0 - dummy_adj)
+
+# predictions = model([dummy_features, dummy_bias_mat])
+# print("Output shape:", predictions.shape) # (1, 2708, 7)
+
+# トレーニング (実際のデータで実行する場合)
+# history = model.fit(
+#     [X_train, bias_mat_train], y_train,
+#     epochs=100,
+#     validation_data=([X_val, bias_mat_val], y_val)
+# )
