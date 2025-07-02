@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow as tf
 
-conv1d = tf.layers.conv1d
+conv1d = tf.compat.v1.layers.conv1d
 
 def attn_head(seq, out_sz, bias_mat, activation, in_drop=0.0, coef_drop=0.0, residual=False):
     with tf.name_scope('my_attn'):
