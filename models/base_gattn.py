@@ -1,89 +1,421 @@
 import tensorflow as tf
+from tensorflow import keras
+import numpy as np
+
 
 class BaseGAttN:
-    def loss(logits, labels, nb_classes, class_weights):
-        sample_wts = tf.reduce_sum(tf.multiply(tf.one_hot(labels, nb_classes), class_weights), axis=-1)
-        xentropy = tf.multiply(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                labels=labels, logits=logits), sample_wts)
-        return tf.reduce_mean(xentropy, name='xentropy_mean')
-
-    def training(loss, lr, l2_coef):
-        # weight decay
-        vars = tf.trainable_variables()
-        lossL2 = tf.add_n([tf.nn.l2_loss(v) for v in vars if v.name not
-                           in ['bias', 'gamma', 'b', 'g', 'beta']]) * l2_coef
-
-        # optimizer
-        opt = tf.train.AdamOptimizer(learning_rate=lr)
-
-        # training op
-        train_op = opt.minimize(loss+lossL2)
+    """
+    Base class for Graph Attention Networks with loss functions and metrics
+    """
+    
+    @staticmethod
+    def weighted_sparse_categorical_crossentropy(y_true, y_pred, class_weights=None):
+        """
+        Weighted sparse categorical crossentropy loss
         
-        return train_op
-
-    def preshape(logits, labels, nb_classes):
-        new_sh_lab = [-1]
-        new_sh_log = [-1, nb_classes]
-        log_resh = tf.reshape(logits, new_sh_log)
-        lab_resh = tf.reshape(labels, new_sh_lab)
+        Args:
+            y_true: True labels [batch_size, ...]
+            y_pred: Predicted logits [batch_size, ..., num_classes]
+            class_weights: Weight for each class [num_classes]
+        
+        Returns:
+            Weighted crossentropy loss
+        """
+        if class_weights is not None:
+            # Convert to tensor if needed
+            class_weights = tf.convert_to_tensor(class_weights, dtype=tf.float32)
+            
+            # Get weights for each sample based on true labels
+            sample_weights = tf.gather(class_weights, y_true)
+            
+            # Compute crossentropy
+            xentropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels=y_true, logits=y_pred
+            )
+            
+            # Apply sample weights
+            weighted_xentropy = tf.multiply(xentropy, sample_weights)
+            return tf.reduce_mean(weighted_xentropy)
+        else:
+            return tf.reduce_mean(
+                tf.nn.sparse_softmax_cross_entropy_with_logits(
+                    labels=y_true, logits=y_pred
+                )
+            )
+    
+    @staticmethod
+    def l2_regularization_loss(model, l2_coef=1e-4):
+        """
+        Compute L2 regularization loss for model weights
+        
+        Args:
+            model: Keras model or list of variables
+            l2_coef: L2 regularization coefficient
+        
+        Returns:
+            L2 regularization loss
+        """
+        if hasattr(model, 'trainable_variables'):
+            variables = model.trainable_variables
+        else:
+            variables = model
+        
+        # Exclude bias terms and normalization parameters
+        exclude_names = ['bias', 'gamma', 'beta', 'b', 'g']
+        
+        l2_losses = []
+        for var in variables:
+            # Check if variable name contains excluded terms
+            if not any(name in var.name.lower() for name in exclude_names):
+                l2_losses.append(tf.nn.l2_loss(var))
+        
+        if l2_losses:
+            return l2_coef * tf.add_n(l2_losses)
+        else:
+            return 0.0
+    
+    @staticmethod
+    def create_optimizer(learning_rate=0.001, optimizer_type='adam', **kwargs):
+        """
+        Create optimizer with specified type and parameters
+        
+        Args:
+            learning_rate: Learning rate
+            optimizer_type: Type of optimizer ('adam', 'sgd', 'rmsprop')
+            **kwargs: Additional optimizer parameters
+        
+        Returns:
+            TensorFlow optimizer
+        """
+        if optimizer_type.lower() == 'adam':
+            return keras.optimizers.Adam(learning_rate=learning_rate, **kwargs)
+        elif optimizer_type.lower() == 'sgd':
+            return keras.optimizers.SGD(learning_rate=learning_rate, **kwargs)
+        elif optimizer_type.lower() == 'rmsprop':
+            return keras.optimizers.RMSprop(learning_rate=learning_rate, **kwargs)
+        else:
+            raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+    
+    @staticmethod
+    def reshape_for_loss(logits, labels, nb_classes):
+        """
+        Reshape logits and labels for loss computation
+        
+        Args:
+            logits: Model predictions [batch_size, seq_len, nb_classes]
+            labels: True labels [batch_size, seq_len]
+            nb_classes: Number of classes
+        
+        Returns:
+            Reshaped logits and labels
+        """
+        # Flatten all dimensions except the last one for logits
+        log_shape = tf.shape(logits)
+        log_resh = tf.reshape(logits, [-1, nb_classes])
+        
+        # Flatten all dimensions for labels
+        lab_resh = tf.reshape(labels, [-1])
+        
         return log_resh, lab_resh
-
-    def confmat(logits, labels):
-        preds = tf.argmax(logits, axis=1)
-        return tf.confusion_matrix(labels, preds)
-
-##########################
-# Adapted from tkipf/gcn #
-##########################
-
-    def masked_softmax_cross_entropy(logits, labels, mask):
-        """Softmax cross-entropy loss with masking."""
-        loss = tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=labels)
-        mask = tf.cast(mask, dtype=tf.float32)
-        mask /= tf.reduce_mean(mask)
-        loss *= mask
-        return tf.reduce_mean(loss)
-
-    def masked_sigmoid_cross_entropy(logits, labels, mask):
-        """Softmax cross-entropy loss with masking."""
-        labels = tf.cast(labels, dtype=tf.float32)
-        loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=logits, labels=labels)
-        loss=tf.reduce_mean(loss,axis=1)
-        mask = tf.cast(mask, dtype=tf.float32)
-        mask /= tf.reduce_mean(mask)
-        loss *= mask
-        return tf.reduce_mean(loss)
-
-    def masked_accuracy(logits, labels, mask):
-        """Accuracy with masking."""
-        correct_prediction = tf.equal(tf.argmax(logits, 1), tf.argmax(labels, 1))
-        accuracy_all = tf.cast(correct_prediction, tf.float32)
-        mask = tf.cast(mask, dtype=tf.float32)
-        mask /= tf.reduce_mean(mask)
-        accuracy_all *= mask
-        return tf.reduce_mean(accuracy_all)
-
-    def micro_f1(logits, labels, mask):
-        """Accuracy with masking."""
-        predicted = tf.round(tf.nn.sigmoid(logits))
-
-        # Use integers to avoid any nasty FP behaviour
-        predicted = tf.cast(predicted, dtype=tf.int32)
-        labels = tf.cast(labels, dtype=tf.int32)
-        mask = tf.cast(mask, dtype=tf.int32)
-
-        # expand the mask so that broadcasting works ([nb_nodes, 1])
-        mask = tf.expand_dims(mask, -1)
+    
+    @staticmethod
+    def confusion_matrix(y_true, y_pred, num_classes=None):
+        """
+        Compute confusion matrix
         
-        # Count true positives, true negatives, false positives and false negatives.
-        tp = tf.count_nonzero(predicted * labels * mask)
-        tn = tf.count_nonzero((predicted - 1) * (labels - 1) * mask)
-        fp = tf.count_nonzero(predicted * (labels - 1) * mask)
-        fn = tf.count_nonzero((predicted - 1) * labels * mask)
+        Args:
+            y_true: True labels
+            y_pred: Predicted logits or probabilities
+            num_classes: Number of classes
+        
+        Returns:
+            Confusion matrix
+        """
+        if len(y_pred.shape) > 1:
+            preds = tf.argmax(y_pred, axis=-1)
+        else:
+            preds = y_pred
+        
+        return tf.math.confusion_matrix(
+            y_true, preds, num_classes=num_classes, dtype=tf.int32
+        )
 
-        # Calculate accuracy, precision, recall and F1 score.
-        precision = tp / (tp + fp)
-        recall = tp / (tp + fn)
-        fmeasure = (2 * precision * recall) / (precision + recall)
-        fmeasure = tf.cast(fmeasure, tf.float32)
-        return fmeasure
+
+class MaskedMetrics:
+    """
+    Metrics with masking support for node classification tasks
+    """
+    
+    @staticmethod
+    def masked_softmax_cross_entropy(y_true, y_pred, mask):
+        """
+        Softmax cross-entropy loss with masking
+        
+        Args:
+            y_true: True labels (one-hot encoded)
+            y_pred: Predicted logits
+            mask: Mask tensor (1 for valid, 0 for masked)
+        
+        Returns:
+            Masked cross-entropy loss
+        """
+        # Compute cross-entropy loss
+        loss = tf.nn.softmax_cross_entropy_with_logits(
+            labels=y_true, logits=y_pred
+        )
+        
+        # Apply mask
+        mask = tf.cast(mask, dtype=tf.float32)
+        # Normalize mask to maintain proper scale
+        mask_sum = tf.reduce_sum(mask)
+        mask_normalized = mask * tf.cast(tf.size(mask), tf.float32) / mask_sum
+        
+        # Apply normalized mask
+        masked_loss = loss * mask_normalized
+        return tf.reduce_mean(masked_loss)
+    
+    @staticmethod
+    def masked_sparse_categorical_crossentropy(y_true, y_pred, mask):
+        """
+        Sparse categorical cross-entropy loss with masking
+        
+        Args:
+            y_true: True labels (sparse)
+            y_pred: Predicted logits
+            mask: Mask tensor
+        
+        Returns:
+            Masked sparse categorical cross-entropy loss
+        """
+        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=y_true, logits=y_pred
+        )
+        
+        mask = tf.cast(mask, dtype=tf.float32)
+        mask_sum = tf.reduce_sum(mask)
+        mask_normalized = mask * tf.cast(tf.size(mask), tf.float32) / mask_sum
+        
+        masked_loss = loss * mask_normalized
+        return tf.reduce_mean(masked_loss)
+    
+    @staticmethod
+    def masked_binary_crossentropy(y_true, y_pred, mask):
+        """
+        Binary cross-entropy loss with masking (for multi-label)
+        
+        Args:
+            y_true: True labels
+            y_pred: Predicted logits
+            mask: Mask tensor
+        
+        Returns:
+            Masked binary cross-entropy loss
+        """
+        y_true = tf.cast(y_true, dtype=tf.float32)
+        
+        # Compute binary cross-entropy
+        loss = tf.nn.sigmoid_cross_entropy_with_logits(
+            labels=y_true, logits=y_pred
+        )
+        
+        # Reduce over label dimensions
+        loss = tf.reduce_mean(loss, axis=-1)
+        
+        # Apply mask
+        mask = tf.cast(mask, dtype=tf.float32)
+        mask_sum = tf.reduce_sum(mask)
+        mask_normalized = mask * tf.cast(tf.size(mask), tf.float32) / mask_sum
+        
+        masked_loss = loss * mask_normalized
+        return tf.reduce_mean(masked_loss)
+    
+    @staticmethod
+    def masked_accuracy(y_true, y_pred, mask):
+        """
+        Accuracy with masking
+        
+        Args:
+            y_true: True labels (one-hot or sparse)
+            y_pred: Predicted logits
+            mask: Mask tensor
+        
+        Returns:
+            Masked accuracy
+        """
+        # Handle both one-hot and sparse labels
+        if len(y_true.shape) == len(y_pred.shape):
+            # One-hot encoded
+            true_classes = tf.argmax(y_true, axis=-1)
+        else:
+            # Sparse labels
+            true_classes = y_true
+        
+        pred_classes = tf.argmax(y_pred, axis=-1)
+        
+        # Compute accuracy
+        correct = tf.equal(true_classes, pred_classes)
+        correct = tf.cast(correct, tf.float32)
+        
+        # Apply mask
+        mask = tf.cast(mask, dtype=tf.float32)
+        mask_sum = tf.reduce_sum(mask)
+        
+        if mask_sum > 0:
+            masked_correct = correct * mask
+            accuracy = tf.reduce_sum(masked_correct) / mask_sum
+        else:
+            accuracy = 0.0
+        
+        return accuracy
+    
+    @staticmethod
+    def masked_f1_score(y_true, y_pred, mask, average='micro'):
+        """
+        F1 score with masking (for multi-label classification)
+        
+        Args:
+            y_true: True labels
+            y_pred: Predicted logits
+            mask: Mask tensor
+            average: Averaging method ('micro', 'macro')
+        
+        Returns:
+            Masked F1 score
+        """
+        # Convert predictions to binary
+        predicted = tf.nn.sigmoid(y_pred)
+        predicted = tf.cast(predicted > 0.5, tf.int32)
+        
+        # Convert labels to int32
+        y_true = tf.cast(y_true, tf.int32)
+        mask = tf.cast(mask, tf.int32)
+        
+        # Expand mask for broadcasting
+        if len(mask.shape) < len(predicted.shape):
+            mask = tf.expand_dims(mask, -1)
+        
+        # Calculate TP, TN, FP, FN with masking
+        tp = tf.reduce_sum(predicted * y_true * mask)
+        tn = tf.reduce_sum((1 - predicted) * (1 - y_true) * mask)
+        fp = tf.reduce_sum(predicted * (1 - y_true) * mask)
+        fn = tf.reduce_sum((1 - predicted) * y_true * mask)
+        
+        # Calculate precision, recall, and F1
+        precision = tf.cond(
+            tp + fp > 0,
+            lambda: tf.cast(tp, tf.float32) / tf.cast(tp + fp, tf.float32),
+            lambda: 0.0
+        )
+        
+        recall = tf.cond(
+            tp + fn > 0,
+            lambda: tf.cast(tp, tf.float32) / tf.cast(tp + fn, tf.float32),
+            lambda: 0.0
+        )
+        
+        f1 = tf.cond(
+            precision + recall > 0,
+            lambda: 2.0 * precision * recall / (precision + recall),
+            lambda: 0.0
+        )
+        
+        return f1
+
+
+class GraphMetrics(keras.metrics.Metric):
+    """
+    Custom Keras metric for graph-based tasks
+    """
+    
+    def __init__(self, metric_fn, name='graph_metric', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.metric_fn = metric_fn
+        self.total = self.add_weight(name='total', initializer='zeros')
+        self.count = self.add_weight(name='count', initializer='zeros')
+    
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        metric_value = self.metric_fn(y_true, y_pred, sample_weight)
+        self.total.assign_add(metric_value)
+        self.count.assign_add(1.0)
+    
+    def result(self):
+        return tf.cond(
+            self.count > 0,
+            lambda: self.total / self.count,
+            lambda: 0.0
+        )
+    
+    def reset_state(self):
+        self.total.assign(0.0)
+        self.count.assign(0.0)
+
+
+# Usage examples and helper functions
+def create_gat_loss_and_metrics(num_classes, class_weights=None, l2_coef=1e-4):
+    """
+    Create loss function and metrics for GAT training
+    
+    Args:
+        num_classes: Number of classes
+        class_weights: Optional class weights
+        l2_coef: L2 regularization coefficient
+    
+    Returns:
+        Dictionary with loss function and metrics
+    """
+    
+    def loss_fn(y_true, y_pred, model=None):
+        # Main loss
+        main_loss = BaseGAttN.weighted_sparse_categorical_crossentropy(
+            y_true, y_pred, class_weights
+        )
+        
+        # L2 regularization
+        if model is not None:
+            l2_loss = BaseGAttN.l2_regularization_loss(model, l2_coef)
+            return main_loss + l2_loss
+        
+        return main_loss
+    
+    def masked_loss_fn(y_true, y_pred, mask):
+        return MaskedMetrics.masked_sparse_categorical_crossentropy(
+            y_true, y_pred, mask
+        )
+    
+    def masked_accuracy_fn(y_true, y_pred, mask):
+        return MaskedMetrics.masked_accuracy(y_true, y_pred, mask)
+    
+    return {
+        'loss': loss_fn,
+        'masked_loss': masked_loss_fn,
+        'masked_accuracy': masked_accuracy_fn,
+        'confusion_matrix': BaseGAttN.confusion_matrix,
+        'masked_f1': MaskedMetrics.masked_f1_score
+    }
+
+
+# Example usage:
+"""
+# Create GAT model and training setup
+num_classes = 7
+class_weights = np.array([1.0, 2.0, 1.5, 1.0, 3.0, 2.5, 1.0])
+
+# Get loss and metrics
+loss_metrics = create_gat_loss_and_metrics(num_classes, class_weights)
+
+# Create optimizer
+optimizer = BaseGAttN.create_optimizer(learning_rate=0.005, optimizer_type='adam')
+
+# In training loop:
+with tf.GradientTape() as tape:
+    logits = model(x, training=True)
+    loss = loss_metrics['loss'](y_true, logits, model)
+
+gradients = tape.gradient(loss, model.trainable_variables)
+optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+# For masked evaluation:
+mask = tf.ones_like(y_true)  # or actual mask
+accuracy = loss_metrics['masked_accuracy'](y_true, logits, mask)
+f1 = loss_metrics['masked_f1'](y_true, logits, mask)
+"""
